@@ -1,0 +1,25 @@
+dist: xenial # For losetup --partscan
+env:
+  # echo -n ... | openssl rsautl -inkey <(curl https://api.travis-ci.org/repos/{owner}/{repo}/key | jq --raw-output .key) -pubin -encrypt | base64 --wrap 0
+  secure: zBTMXBdg1itdQK+OUL0Sfr+0fH8pKIRRxO47Ac1+w2CCR1imUSQb+HbskpREha22cQaE3wcWZrTCueIMVs/Nxhcu9fZ7isbeVo8eNYGY6+VYIloEWiZvd0WORrdc6qnkycZ+TmrpVHD0xD6llzIIRGj4noRwo5v0h+IDSRaSr4mULD/nNh/YsJ8sOij3ddq4bt3ZdmJUidksN+8V7zN7jT618QNOqsjv+vQKCzupuiS3roTsWocre8+4trZcq9fiB++T+TqgEVocNcx2hV7D3DelpZZ209B2NltxsVniZiguMYx67qBoOzHYlDSmMaz6z8QMc77pbFhfVrA0+A+z4S7SqBT/a9J+Iy3eSlcQhcpJOWDZDSI/SK78M0s2Xtm5tN8psvmyMWrymiLXTUc129wi2rCIWtLzpfMB2GJBR3bk2Upe97XwxNH+UxbcN/pCpcG2EXwPkBGEC4ttgKEVAc9gkJ73AoNKaGFiEBwXDLqxTnCywf5F8k9fzIuYLwMxppvvVb/r219O68K81j1Q0kAwkyTTvpj689e5lMSpVqtmocvmB0VME0WihgCXlVHD1wIZtZFlIZyl4HsgGjMv56rFiG7bgG5KXR0ddQAMnzYtvf270V04HSLNuz00k5h/Xgp14XsBjNEd0H7XddaJki+2Nvlki2qtyHT0h/NzRYI=
+before_install:
+# https://docs.travis-ci.com/user/encrypting-files
+- openssl aes-256-cbc -in wpa_supplicant.conf.enc -out wpa_supplicant.conf -d -K $key -iv $iv
+- openssl aes-256-cbc -in secure.json.enc -out secure.json -d -K $key -iv $iv
+- sudo apt-get --assume-yes install
+    awscli
+    qemu-user-static
+script:
+# Round number < 10 minutes and > the expected download time. Travis CI
+# will terminate the build if there's no output for 10 minutes.
+# - It's not the case that there's a socket error or system timeout that
+#   wget is missing. I used urllib3 to check.
+# - wget --read-timeout 300 doesn't help: The download isn't idle, it's
+#   just slow.
+# - travis_wait might work, if we knew how long to wait. This is better:
+#   besides some output, we'll maybe get a faster connection!
+- until timeout 300 make raspbian_latest; do :; done
+- make
+after_success:
+- zip $(basename *.img .img).zip *.img
+- aws s3 cp *.zip s3://piamresponding

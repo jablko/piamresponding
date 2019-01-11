@@ -1,0 +1,236 @@
+package require json
+package require json::write
+package require md5
+package require websocket
+
+set channel [open secure.json]
+set data [read $channel]
+close $channel
+set secure [json::json2dict $data]
+
+# RPi-Distro comes with Chromium 65 at the moment, which is too old for
+# the flattened protocol -- but we can emulate it for now.
+# https://github.com/RPi-Distro/chromium-browser
+# https://crrev.com/c/1124936
+proc send {sock type data} {
+  set message [json::json2dict $data]
+  if {[dict exists $message sessionId]} {
+    set id [dict get $message id]
+    set sessionId [dict get $message sessionId]
+    # Message must have integer id property
+    set data "{
+      \"id\": -$id,
+      \"method\": \"Target.sendMessageToTarget\",
+      \"params\": {
+        \"message\": [json::write string $data],
+        \"sessionId\": [json::write string $sessionId]
+      }
+    }"
+  }
+  websocket::send $sock $type $data
+}
+
+proc expect_message {key value} {
+  while 1 {
+    # The recommended way of writing a version of yield that allows
+    # resumption with multiple arguments is by using yieldto and the
+    # return command. coroutine(3tcl)
+    lassign [yieldto return -level 0] sock type data
+    set message [json::json2dict $data]
+    if {[dict exists $message method] && [dict get $message method] eq "Target.receivedMessageFromTarget"} {
+      set sessionId [dict get $message params sessionId]
+      set data [dict get $message params message]
+      set message [json::json2dict $data]
+      dict set message sessionId $sessionId
+    }
+    if {[dict exists $message error]} {
+      error [dict get $message error message]
+    }
+    if {[dict exists $message $key] && [dict get $message $key] eq $value} {
+      return $message
+    }
+  }
+}
+
+coroutine client eval {
+  while 1 {
+    lassign [yieldto return -level 0] sock type data
+    if {$type eq "connect"} {
+      break
+    }
+  }
+  send $sock text "{
+    \"id\": [incr id],
+    \"method\": \"Target.getTargets\"
+  }"
+
+  set message [expect_message id $id]
+  foreach targetInfo [dict get $message result targetInfos] {
+    if {[dict get $targetInfo type] eq "page"} {
+      break
+    }
+  }
+  set targetId [dict get $targetInfo targetId]
+  send $sock text "{
+    \"id\": [incr id],
+    \"method\": \"Target.attachToTarget\",
+    \"params\": {
+      \"targetId\": [json::write string $targetId],
+      \"flatten\": true
+    }
+  }"
+
+  set message [expect_message method Target.attachedToTarget]
+  set sessionId [dict get $message params sessionId]
+  send $sock text "{
+    \"id\": [incr id],
+    \"method\": \"Page.enable\",
+    \"sessionId\": [json::write string $sessionId]
+  }"
+
+  while 1 {
+    while 1 {
+      set message [expect_message method Page.frameNavigated]
+      if {[dict get $message params frame url] ne "chrome-error://chromewebdata/"} {
+        break
+      }
+    }
+
+    expect_message method Page.domContentEventFired
+    send $sock text "{
+      \"id\": [incr id],
+      \"method\": \"Runtime.evaluate\",
+      \"params\": {
+        \"expression\": \"document.getElementById('lnkDesktop').click()\"
+      },
+      \"sessionId\": [json::write string $sessionId]
+    }"
+
+    while 1 {
+      set message [expect_message method Page.frameNavigated]
+      if {[dict get $message params frame url] ne "chrome-error://chromewebdata/"} {
+        break
+      }
+    }
+
+    expect_message method Page.domContentEventFired
+    send $sock text "{
+      \"id\": [incr id],
+      \"method\": \"Runtime.evaluate\",
+      \"params\": {
+        \"expression\": [json::write string "
+          document.getElementById('ddlsubsciribers').value = [json::write string [dict get $secure ddlsubsciribers]]
+          document.getElementById('memberfname').value = [json::write string [dict get $secure memberfname]]
+          document.getElementById('memberpwd').value = [json::write string [dict get $secure memberpwd]]
+          document.getElementById('login').click()
+        "]
+      },
+      \"sessionId\": [json::write string $sessionId]
+    }"
+
+    # There was a communication failure with the server. Log in again to
+    # make sure you have the latest information in the screen.
+    expect_message method Page.javascriptDialogOpening
+    send $sock text "{
+      \"id\": [incr id],
+      \"method\": \"Page.navigate\",
+      \"params\": {
+        \"url\": \"https://iamresponding.com\"
+      },
+      \"sessionId\": [json::write string $sessionId]
+    }"
+  }
+}
+
+file mkdir .config/chromium/Default
+set channel [open .config/chromium/Default/Preferences w]
+puts $channel "{
+  \"credentials_enable_service\": false
+}"
+close $channel
+spawn chromium-browser \
+  --remote-debugging-port=9222 \
+  --start-fullscreen \
+  iamresponding.com
+# regexp -line . \r -> 1 😞
+expect -timeout -1 -re {DevTools listening on ([^\r]*)}
+set url $expect_out(1,string)
+websocket::open $url client
+
+proc c_eval string {
+  set cmdName [string tolower [md5::md5 -hex $string]]
+  if {![file exists $cmdName[info sharedlibextension]]} {
+    exec cc \
+      -o $cmdName[info sharedlibextension] \
+      -x c \
+      -shared \
+      -I /usr/include/tcl[info tclversion] \
+      - << "
+        #include <tcl.h>
+
+        static int proc(ClientData clientData, Tcl_Interp *interp, int objc,
+                        Tcl_Obj *const *objv) {
+          $string
+          return TCL_OK;
+        }
+
+        int Package_Init(Tcl_Interp *interp) {
+          Tcl_CreateObjCommand(interp, \"$cmdName\", proc, NULL, NULL);
+          return TCL_OK;
+        }
+      " >@ stdout 2>@ stderr
+  }
+  load [file join [pwd] $cmdName[info sharedlibextension]] package
+  uplevel 1 $cmdName
+}
+
+# GPIO sysfs interface is deprecated.
+# https://www.kernel.org/doc/Documentation/gpio/sysfs.txt
+set chip [open /dev/gpiochip0]
+c_eval {
+  #include <sys/ioctl.h>
+  #include <linux/gpio.h>
+  #include <stdint.h>
+
+  const char *channelName;
+  Tcl_Channel channel;
+  int fd;
+  struct gpioevent_request req;
+
+  channelName = Tcl_GetVar(interp, "chip", TCL_LEAVE_ERR_MSG);
+  if (channelName == NULL) {
+    return TCL_ERROR;
+  }
+  channel = Tcl_GetChannel(interp, channelName, NULL);
+  if (channel == NULL) {
+    return TCL_ERROR;
+  }
+  if (Tcl_GetChannelHandle(channel, TCL_READABLE, (ClientData *)&fd) !=
+      TCL_OK) {
+    return TCL_ERROR;
+  }
+  // https://youtu.be/lQRCDl0tFiQ?t=2890
+  req.lineoffset = 17;
+  req.handleflags = GPIOHANDLE_REQUEST_INPUT;
+  req.eventflags = GPIOEVENT_REQUEST_RISING_EDGE;
+  if (ioctl(fd, GPIO_GET_LINEEVENT_IOCTL, &req)) {
+    Tcl_SetObjResult(
+        interp, Tcl_ObjPrintf("failed to issue GPIO GET LINEEVENT IOCTL: %s",
+                              Tcl_PosixError(interp)));
+    return TCL_ERROR;
+  }
+  channel = Tcl_MakeFileChannel((ClientData)(intptr_t)req.fd, TCL_READABLE);
+  Tcl_RegisterChannel(interp, channel);
+  channelName = Tcl_GetChannelName(channel);
+  if (Tcl_SetVar(interp, "channel", channelName, TCL_LEAVE_ERR_MSG) == NULL) {
+    return TCL_ERROR;
+  }
+}
+fconfigure $channel -blocking 0
+fileevent $channel readable {
+  # Drain the event channel to stop repeated callbacks
+  read $channel
+  exec xset dpms force on s reset >@ stdout 2>@ stderr
+}
+
+vwait forever

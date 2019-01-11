@@ -1,0 +1,23 @@
+# aws cloudformation deploy \
+#   --template-file template.yaml \
+#   --stack-name piamresponding \
+#   --capabilities CAPABILITY_IAM \
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: piamresponding
+      LifecycleConfiguration:
+        Rules:
+        - ExpirationInDays: 365
+          Status: Enabled
+  User:
+    Type: AWS::IAM::User
+    Properties:
+      Policies:
+      - PolicyName: piamresponding
+        PolicyDocument:
+          Statement:
+            Effect: Allow
+            Action: s3:PutObject
+            Resource: !Sub ${Bucket.Arn}/*
